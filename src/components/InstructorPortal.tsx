@@ -12,7 +12,16 @@ import {
   where,
   deleteField
 } from 'firebase/firestore';
-import { db, auth, googleProvider, signInWithPopup, signOut } from '../lib/firebase';
+import { 
+  db, 
+  auth, 
+  googleProvider, 
+  signInWithPopup, 
+  signInWithRedirect, 
+  getRedirectResult, 
+  signOut, 
+  getAuthErrorMessage 
+} from '../lib/firebase';
 import { Course, StudentScoreItem, StudentRecord, DEFAULT_SCORE_COLUMNS } from '../types';
 import { parseCSV, parseCSVWithDetails, exportToCSV, generateSampleCSV, CSVParseResult } from '../lib/csvHelper';
 import { GOOGLE_APPS_SCRIPT_CODE } from '../lib/gasTemplate';
@@ -51,7 +60,12 @@ import {
   HelpCircle,
   ToggleLeft,
   ToggleRight,
-  Clock
+  Clock,
+  Globe,
+  RefreshCw,
+  Smartphone,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react';
 
 interface InstructorPortalProps {
@@ -132,12 +146,69 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
   const [notifyMsg, setNotifyMsg] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
 
+  // Authentication states & Netlify diagnostics
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [copiedHostname, setCopiedHostname] = useState(false);
+  const [showNetlifyGuide, setShowNetlifyGuide] = useState(false);
+
   const showNotification = (type: 'success' | 'error' | 'info', text: string) => {
     setNotifyMsg({ type, text });
     setTimeout(() => setNotifyMsg(null), 5000);
   };
 
   const isBuEmail = user?.email?.toLowerCase().endsWith('@bu.ac.th');
+
+  // Copy current domain for Firebase Authorized Domains setup
+  const copyCurrentDomain = () => {
+    if (typeof window !== 'undefined') {
+      const hostname = window.location.hostname;
+      navigator.clipboard.writeText(hostname);
+      setCopiedHostname(true);
+      setTimeout(() => setCopiedHostname(false), 2500);
+      showNotification('success', `คัดลอกโดเมน "${hostname}" เรียบร้อยแล้ว!`);
+    }
+  };
+
+  // Check for redirect result on page load (Mobile / Safari fallback)
+  useEffect(() => {
+    let isMounted = true;
+    getRedirectResult(auth)
+      .then(async result => {
+        if (!isMounted) return;
+        if (result && result.user) {
+          const email = result.user.email?.toLowerCase().trim() || '';
+          if (!email.endsWith('@bu.ac.th')) {
+            await signOut(auth);
+            const errText = `อีเมล "${result.user.email || ''}" ไม่ใช่บัญชีของมหาวิทยาลัยกรุงเทพ (@bu.ac.th) กรุณาเข้าสู่ระบบด้วยบัญชี @bu.ac.th ของอาจารย์ผู้สอนเท่านั้น`;
+            setLoginError(errText);
+            showNotification('error', 'ปฏิเสธการเข้าสู่ระบบ: อนุญาตเฉพาะบัญชีอาจารย์ @bu.ac.th เท่านั้น');
+          } else {
+            setLoginError(null);
+            showNotification('success', `ยินดีต้อนรับอาจารย์ ${result.user.displayName || result.user.email}`);
+          }
+        }
+      })
+      .catch(err => {
+        if (!isMounted) return;
+        console.error('Redirect sign-in error:', err);
+        const msg = getAuthErrorMessage(err);
+        setLoginError(msg);
+        showNotification('error', msg);
+      })
+      .finally(() => {
+        if (typeof window !== 'undefined') {
+          sessionStorage.removeItem('auth_redirect_pending');
+        }
+        if (isMounted) {
+          setIsLoggingIn(false);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // Fetch courses owned by this instructor
   const fetchCourses = async () => {
@@ -244,14 +315,65 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
     }
   };
 
-  // Google Login
-  const handleGoogleLogin = async () => {
+  // Google Login with Popup and Automatic Fallback to Redirect
+  const handleGoogleLogin = async (useRedirect: boolean = false) => {
+    setLoginError(null);
+    setIsLoggingIn(true);
+
+    if (useRedirect) {
+      try {
+        if (typeof window !== 'undefined') {
+          sessionStorage.setItem('auth_redirect_pending', 'instructor');
+        }
+        await signInWithRedirect(auth, googleProvider);
+        return;
+      } catch (err: any) {
+        console.error('Redirect sign-in initiation error:', err);
+        const msg = getAuthErrorMessage(err);
+        setLoginError(msg);
+        showNotification('error', msg);
+        setIsLoggingIn(false);
+        return;
+      }
+    }
+
     try {
-      await signInWithPopup(auth, googleProvider);
-      showNotification('success', 'เข้าสู่ระบบสำเร็จ');
+      const result = await signInWithPopup(auth, googleProvider);
+      const email = result.user.email?.toLowerCase().trim() || '';
+
+      if (!email.endsWith('@bu.ac.th')) {
+        await signOut(auth);
+        const errText = `อีเมล "${result.user.email || ''}" ไม่ใช่บัญชีของมหาวิทยาลัยกรุงเทพ (@bu.ac.th) กรุณาเข้าสู่ระบบด้วยบัญชี @bu.ac.th ของอาจารย์ผู้สอนเท่านั้น`;
+        setLoginError(errText);
+        showNotification('error', 'ปฏิเสธการเข้าสู่ระบบ: อนุญาตเฉพาะบัญชีอาจารย์ @bu.ac.th เท่านั้น');
+        return;
+      }
+
+      setLoginError(null);
+      showNotification('success', `เข้าสู่ระบบสำเร็จ: ${result.user.displayName || result.user.email}`);
     } catch (err: any) {
-      console.error(err);
-      showNotification('error', `ไม่สามารถเข้าสู่ระบบได้: ${err.message}`);
+      console.error('Google Sign-in popup error:', err);
+      // Auto-fallback to redirect if popup is blocked by browser/mobile
+      if (err.code === 'auth/popup-blocked' || err.code === 'auth/cancelled-popup-request') {
+        showNotification('info', 'เบราว์เซอร์บล็อกป็อปอัป กำลังสลับไปใช้ Redirect Mode อัตโนมัติ...');
+        try {
+          if (typeof window !== 'undefined') {
+            sessionStorage.setItem('auth_redirect_pending', 'instructor');
+          }
+          await signInWithRedirect(auth, googleProvider);
+          return;
+        } catch (redirectErr) {
+          const msg = getAuthErrorMessage(redirectErr);
+          setLoginError(msg);
+          showNotification('error', msg);
+        }
+      } else {
+        const msg = getAuthErrorMessage(err);
+        setLoginError(msg);
+        showNotification('error', msg);
+      }
+    } finally {
+      setIsLoggingIn(false);
     }
   };
 
@@ -1054,48 +1176,171 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
 
   // Login view if not logged in
   if (!user) {
-    return (
-      <div className="max-w-md mx-auto py-12 px-4">
-        <div className="bg-white rounded-3xl border border-slate-200 shadow-md p-6 sm:p-8 text-center">
-          <div className="w-14 h-14 bg-amber-50 border border-amber-200 rounded-2xl flex items-center justify-center mx-auto mb-4 text-amber-600 shadow-xs">
-            <BookOpen className="w-7 h-7" />
-          </div>
-          <h2 className="text-2xl font-bold text-slate-900">สำหรับอาจารย์ผู้สอน</h2>
-          <p className="text-sm text-slate-500 mt-2 mb-6">
-            เข้าสู่ระบบเพื่อจัดการรายวิชา นำเข้าไฟล์คะแนน CSV และควบคุมการประกาศผลคะแนน
-          </p>
+    const currentHost = typeof window !== 'undefined' ? window.location.hostname : 'your-site.netlify.app';
 
-          <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 text-xs text-amber-800 text-left mb-6 flex items-start space-x-2.5">
-            <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+    return (
+      <div className="max-w-xl mx-auto py-10 px-4">
+        <div className="bg-white rounded-3xl border border-slate-200 shadow-md p-6 sm:p-8 text-center space-y-6">
+          <div>
+            <div className="w-14 h-14 bg-amber-50 border border-amber-200 rounded-2xl flex items-center justify-center mx-auto mb-4 text-amber-600 shadow-xs">
+              <BookOpen className="w-7 h-7" />
+            </div>
+            <h2 className="text-2xl font-bold text-slate-900">สำหรับอาจารย์ผู้สอน</h2>
+            <p className="text-sm text-slate-500 mt-2">
+              เข้าสู่ระบบเพื่อจัดการรายวิชา นำเข้าไฟล์คะแนน CSV และควบคุมการประกาศผลคะแนน
+            </p>
+          </div>
+
+          {/* Security requirement notice */}
+          <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 text-xs text-amber-900 text-left flex items-start space-x-3 shadow-xs">
+            <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
             <div>
-              <strong>ข้อกำหนดความปลอดภัย:</strong> กำหนดให้เข้าสู่ระบบด้วย Google Account ของมหาวิทยาลัยกรุงเทพ (โดเมน <code>@bu.ac.th</code>)
+              <strong className="font-bold text-amber-950">ข้อกำหนดความปลอดภัย:</strong>
+              <p className="mt-1 text-amber-800 leading-relaxed">
+                กำหนดให้เข้าสู่ระบบด้วย Google Account ของมหาวิทยาลัยกรุงเทพ (โดเมน <code className="bg-amber-100/80 px-1.5 py-0.5 rounded font-mono font-semibold text-amber-900">@bu.ac.th</code>) เท่านั้น บัญชีอีเมลอื่นจะไม่สามารถเข้าถึงระบบได้
+              </p>
             </div>
           </div>
 
-          <button
-            onClick={handleGoogleLogin}
-            className="w-full py-3.5 px-4 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-semibold text-sm shadow-md transition flex items-center justify-center space-x-3 cursor-pointer"
-          >
-            <svg className="w-5 h-5" viewBox="0 0 24 24">
-              <path
-                fill="#4285F4"
-                d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
-              />
-              <path
-                fill="#34A853"
-                d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-              />
-              <path
-                fill="#FBBC05"
-                d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"
-              />
-              <path
-                fill="#EA4335"
-                d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"
-              />
-            </svg>
-            <span>เข้าสู่ระบบด้วย Google Account</span>
-          </button>
+          {/* Prominent Login Error Alert Box if any */}
+          {loginError && (
+            <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 sm:p-5 text-left text-xs text-rose-900 shadow-sm animate-in fade-in duration-200">
+              <div className="flex items-start space-x-3">
+                <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                <div className="flex-1 space-y-2">
+                  <div className="font-bold text-sm text-rose-950">
+                    เข้าสู่ระบบไม่สำเร็จ
+                  </div>
+                  <p className="text-rose-800 leading-relaxed font-medium">
+                    {loginError}
+                  </p>
+
+                  {/* If domain unauthorized, provide quick domain copier for Netlify */}
+                  {(loginError.includes('Authorized domains') || loginError.includes('unauthorized-domain')) && (
+                    <div className="mt-3 p-3 bg-white rounded-xl border border-rose-200 space-y-2">
+                      <div className="text-[11px] font-semibold text-rose-900">
+                        Domain ของเว็บไซต์ Netlify ปัจจุบัน:
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <code className="flex-1 bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-lg text-slate-800 font-mono text-xs select-all truncate">
+                          {currentHost}
+                        </code>
+                        <button
+                          type="button"
+                          onClick={copyCurrentDomain}
+                          className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-medium text-xs rounded-lg transition shrink-0 flex items-center space-x-1 cursor-pointer"
+                        >
+                          {copiedHostname ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                          <span>{copiedHostname ? 'คัดลอกแล้ว' : 'คัดลอก Domain'}</span>
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-slate-600">
+                        💡 <strong>วิธีแก้ไข:</strong> เข้าสู่ Firebase Console &rarr; Authentication &rarr; Settings &rarr; เลื่อนลงไปที่ <strong>Authorized domains</strong> &rarr; กด <strong>Add domain</strong> แล้ววางโดเมนนี้ลงไป
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Action Buttons */}
+          <div className="space-y-3 pt-2">
+            {/* Primary Google Login Button (Popup mode) */}
+            <button
+              type="button"
+              disabled={isLoggingIn}
+              onClick={() => handleGoogleLogin(false)}
+              className="w-full py-3.5 px-4 rounded-xl bg-slate-900 hover:bg-slate-800 active:scale-[0.99] disabled:opacity-60 disabled:cursor-not-allowed text-white font-semibold text-sm shadow-md transition flex items-center justify-center space-x-3 cursor-pointer"
+            >
+              {isLoggingIn ? (
+                <>
+                  <RefreshCw className="w-5 h-5 animate-spin text-slate-400" />
+                  <span>กำลังเชื่อมต่อกับ Google...</span>
+                </>
+              ) : (
+                <>
+                  <svg className="w-5 h-5 shrink-0" viewBox="0 0 24 24">
+                    <path
+                      fill="#4285F4"
+                      d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                    />
+                    <path
+                      fill="#34A853"
+                      d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                    />
+                    <path
+                      fill="#FBBC05"
+                      d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"
+                    />
+                    <path
+                      fill="#EA4335"
+                      d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"
+                    />
+                  </svg>
+                  <span>เข้าสู่ระบบด้วย Google Account (@bu.ac.th)</span>
+                </>
+              )}
+            </button>
+
+            {/* Secondary Button: Redirect Mode for Mobile / Safari */}
+            <button
+              type="button"
+              disabled={isLoggingIn}
+              onClick={() => handleGoogleLogin(true)}
+              className="w-full py-2.5 px-4 rounded-xl border border-slate-300 hover:bg-slate-50 active:scale-[0.99] disabled:opacity-60 text-slate-700 font-medium text-xs transition flex items-center justify-center space-x-2 cursor-pointer"
+            >
+              <Smartphone className="w-4 h-4 text-slate-500" />
+              <span>เข้าสู่ระบบด้วย Redirect Mode (สำหรับมือถือ / Safari / กรณีป็อปอัปไม่ขึ้น)</span>
+            </button>
+          </div>
+
+          {/* Interactive Collapsible Checklist for Netlify & Firebase Setup */}
+          <div className="pt-2 border-t border-slate-100 text-left">
+            <button
+              type="button"
+              onClick={() => setShowNetlifyGuide(!showNetlifyGuide)}
+              className="w-full flex items-center justify-between py-2 text-xs font-semibold text-slate-600 hover:text-indigo-600 transition cursor-pointer"
+            >
+              <span className="flex items-center space-x-1.5">
+                <Globe className="w-4 h-4 text-indigo-500" />
+                <span>Checklist & วิธีแก้ปัญหาล็อกอินบน Netlify & Firebase Console</span>
+              </span>
+              {showNetlifyGuide ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </button>
+
+            {showNetlifyGuide && (
+              <div className="mt-3 p-4 bg-slate-50 border border-slate-200 rounded-2xl text-xs text-slate-700 space-y-3 animate-in fade-in duration-150">
+                <div className="font-bold text-slate-900 flex items-center space-x-1.5">
+                  <CheckCircle className="w-4 h-4 text-emerald-600" />
+                  <span>3 จุดสำคัญที่ต้องตรวจสอบเมื่อ Deploy บน Netlify:</span>
+                </div>
+
+                <div className="space-y-2.5">
+                  <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-1">
+                    <strong className="text-indigo-900 block font-semibold">1. เพิ่ม Netlify Domain ใน Firebase Authorized Domains:</strong>
+                    <p className="text-slate-600 leading-relaxed text-[11px]">
+                      ไปที่ <strong>Firebase Console</strong> &rarr; เลือกโปรเจกต์ของคุณ &rarr; <strong>Authentication</strong> &rarr; เมนู <strong>Settings</strong> &rarr; เลื่อนลงไปที่ <strong>Authorized domains</strong> &rarr; กดปุ่ม <strong>Add domain</strong> &rarr; วาง <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-indigo-700">{currentHost}</code> (หรือ <code className="bg-slate-100 px-1 py-0.5 rounded font-mono">your-site.netlify.app</code>) แล้วกดบันทึก
+                    </p>
+                  </div>
+
+                  <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-1">
+                    <strong className="text-indigo-900 block font-semibold">2. ตรวจสอบการเปิดใช้งาน Google Sign-in Provider:</strong>
+                    <p className="text-slate-600 leading-relaxed text-[11px]">
+                      ไปที่ <strong>Firebase Console</strong> &rarr; <strong>Authentication</strong> &rarr; เมนู <strong>Sign-in method</strong> &rarr; ตรวจสอบว่า <strong>Google</strong> มีสถานะเป็น <strong>Enabled</strong> และมี Project support email ระบุไว้เรียบร้อยแล้ว
+                    </p>
+                  </div>
+
+                  <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-1">
+                    <strong className="text-indigo-900 block font-semibold">3. ตั้งค่า Environment Variables บน Netlify:</strong>
+                    <p className="text-slate-600 leading-relaxed text-[11px]">
+                      ไปที่ <strong>Netlify Dashboard</strong> &rarr; เลือกเว็บของคุณ &rarr; <strong>Site configuration</strong> &rarr; <strong>Environment variables</strong> &rarr; เพิ่มคีย์ <code>VITE_FIREBASE_API_KEY</code>, <code>VITE_FIREBASE_AUTH_DOMAIN</code>, <code>VITE_FIREBASE_PROJECT_ID</code> ฯลฯ ให้ครบถ้วน จากนั้นกด <strong>Trigger deploy &gt; Clear cache and deploy site</strong>
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );

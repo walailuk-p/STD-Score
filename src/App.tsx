@@ -7,12 +7,27 @@ import { InstructorPortal } from './components/InstructorPortal';
 import { GraduationCap, ShieldCheck, Heart, Sparkles, BookOpen } from 'lucide-react';
 
 export default function App() {
-  const [currentTab, setCurrentTab] = useState<'student' | 'instructor'>('student');
+  const [currentTab, setCurrentTab] = useState<'student' | 'instructor'>(() => {
+    if (typeof window !== 'undefined' && sessionStorage.getItem('auth_redirect_pending') === 'instructor') {
+      return 'instructor';
+    }
+    return 'student';
+  });
   const [instructorUser, setInstructorUser] = useState<FirebaseUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, user => {
+    const unsubscribe = onAuthStateChanged(auth, async user => {
+      if (user) {
+        const email = user.email?.toLowerCase().trim() || '';
+        if (!email.endsWith('@bu.ac.th')) {
+          console.warn('Rejected non-bu email in App state:', email);
+          await signOut(auth);
+          setInstructorUser(null);
+          setAuthLoading(false);
+          return;
+        }
+      }
       setInstructorUser(user);
       setAuthLoading(false);
     });
