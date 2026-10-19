@@ -22,6 +22,12 @@ export default function App() {
         const email = user.email?.toLowerCase().trim() || '';
         if (!email.endsWith('@bu.ac.th')) {
           console.warn('Rejected non-bu email in App state:', email);
+          if (typeof window !== 'undefined') {
+            sessionStorage.setItem(
+              'bu_auth_rejected_error',
+              `อีเมล "${user.email || ''}" ไม่ใช่บัญชีของมหาวิทยาลัยกรุงเทพ (@bu.ac.th) ระบบอนุญาตเฉพาะอาจารย์ผู้สอนที่ใช้อีเมลลงท้ายด้วย @bu.ac.th เท่านั้น`
+            );
+          }
           await signOut(auth);
           setInstructorUser(null);
           setAuthLoading(false);

@@ -21,6 +21,7 @@ export const resolvedFirebaseConfig = {
   firestoreDatabaseId: env.VITE_FIREBASE_FIRESTORE_DATABASE_ID || env.VITE_FIREBASE_DATABASE_ID || localAppletConfig?.firestoreDatabaseId || '',
   storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || localAppletConfig?.storageBucket || '',
   messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || localAppletConfig?.messagingSenderId || '',
+  oAuthClientId: env.VITE_GOOGLE_CLIENT_ID || (localAppletConfig as any)?.oAuthClientId || '',
 };
 
 const app = getApps().length === 0 ? initializeApp(resolvedFirebaseConfig) : getApp();

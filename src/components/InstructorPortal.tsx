@@ -20,7 +20,8 @@ import {
   signInWithRedirect, 
   getRedirectResult, 
   signOut, 
-  getAuthErrorMessage 
+  getAuthErrorMessage,
+  resolvedFirebaseConfig
 } from '../lib/firebase';
 import { Course, StudentScoreItem, StudentRecord, DEFAULT_SCORE_COLUMNS } from '../types';
 import { parseCSV, parseCSVWithDetails, exportToCSV, generateSampleCSV, CSVParseResult } from '../lib/csvHelper';
@@ -170,9 +171,20 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
     }
   };
 
-  // Check for redirect result on page load (Mobile / Safari fallback)
+  // Check for rejected error or redirect result on page load (Mobile / Safari fallback)
   useEffect(() => {
     let isMounted = true;
+
+    // Check if App level auth observer caught a non-bu email
+    if (typeof window !== 'undefined') {
+      const rejectedError = sessionStorage.getItem('bu_auth_rejected_error');
+      if (rejectedError) {
+        setLoginError(rejectedError);
+        showNotification('error', rejectedError);
+        sessionStorage.removeItem('bu_auth_rejected_error');
+      }
+    }
+
     getRedirectResult(auth)
       .then(async result => {
         if (!isMounted) return;
@@ -180,7 +192,7 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
           const email = result.user.email?.toLowerCase().trim() || '';
           if (!email.endsWith('@bu.ac.th')) {
             await signOut(auth);
-            const errText = `อีเมล "${result.user.email || ''}" ไม่ใช่บัญชีของมหาวิทยาลัยกรุงเทพ (@bu.ac.th) กรุณาเข้าสู่ระบบด้วยบัญชี @bu.ac.th ของอาจารย์ผู้สอนเท่านั้น`;
+            const errText = `อีเมล "${result.user.email || ''}" ไม่ใช่บัญชีของมหาวิทยาลัยกรุงเทพ (@bu.ac.th) ระบบอนุญาตเฉพาะอาจารย์ผู้สอนที่ใช้อีเมลลงท้ายด้วย @bu.ac.th เท่านั้น`;
             setLoginError(errText);
             showNotification('error', 'ปฏิเสธการเข้าสู่ระบบ: อนุญาตเฉพาะบัญชีอาจารย์ @bu.ac.th เท่านั้น');
           } else {
@@ -1176,7 +1188,9 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
 
   // Login view if not logged in
   if (!user) {
-    const currentHost = typeof window !== 'undefined' ? window.location.hostname : 'your-site.netlify.app';
+    const currentHost = typeof window !== 'undefined' ? (window.location.hostname || 'score-ma102.netlify.app') : 'score-ma102.netlify.app';
+    const activeProjectId = resolvedFirebaseConfig.projectId || 'studious-axe-6ct7q';
+    const activeAuthDomain = resolvedFirebaseConfig.authDomain || `${activeProjectId}.firebaseapp.com`;
 
     return (
       <div className="max-w-xl mx-auto py-10 px-4">
@@ -1195,48 +1209,57 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
           <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 text-xs text-amber-900 text-left flex items-start space-x-3 shadow-xs">
             <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
             <div>
-              <strong className="font-bold text-amber-950">ข้อกำหนดความปลอดภัย:</strong>
+              <strong className="font-bold text-amber-950">ข้อกำหนดความปลอดภัยของระบบ:</strong>
               <p className="mt-1 text-amber-800 leading-relaxed">
-                กำหนดให้เข้าสู่ระบบด้วย Google Account ของมหาวิทยาลัยกรุงเทพ (โดเมน <code className="bg-amber-100/80 px-1.5 py-0.5 rounded font-mono font-semibold text-amber-900">@bu.ac.th</code>) เท่านั้น บัญชีอีเมลอื่นจะไม่สามารถเข้าถึงระบบได้
+                ระบบเปิดสิทธิ์ให้อาจารย์ล็อกอินด้วย Google Account ของมหาวิทยาลัยกรุงเทพ (โดเมน <code className="bg-amber-100/80 px-1.5 py-0.5 rounded font-mono font-semibold text-amber-900">@bu.ac.th</code>) เท่านั้น หากใช้อีเมลส่วนตัว (@gmail.com) หรืออีเมลอื่น ระบบจะปฏิเสธการเข้าถึงทันที
               </p>
             </div>
           </div>
 
           {/* Prominent Login Error Alert Box if any */}
           {loginError && (
-            <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 sm:p-5 text-left text-xs text-rose-900 shadow-sm animate-in fade-in duration-200">
+            <div className="bg-rose-50 border-2 border-rose-300 rounded-2xl p-4 sm:p-5 text-left text-xs text-rose-950 shadow-sm animate-in fade-in duration-200 space-y-3">
               <div className="flex items-start space-x-3">
                 <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
                 <div className="flex-1 space-y-2">
-                  <div className="font-bold text-sm text-rose-950">
-                    เข้าสู่ระบบไม่สำเร็จ
+                  <div className="font-bold text-sm text-rose-950 flex items-center justify-between">
+                    <span>การเข้าสู่ระบบไม่สำเร็จ</span>
+                    <span className="text-[10px] font-mono px-2 py-0.5 bg-rose-200/70 rounded text-rose-900 font-normal">
+                      Security Alert
+                    </span>
                   </div>
-                  <p className="text-rose-800 leading-relaxed font-medium">
+                  <p className="text-rose-900 leading-relaxed font-semibold">
                     {loginError}
                   </p>
 
-                  {/* If domain unauthorized, provide quick domain copier for Netlify */}
+                  {/* If unauthorized-domain or netlify domain error */}
                   {(loginError.includes('Authorized domains') || loginError.includes('unauthorized-domain')) && (
-                    <div className="mt-3 p-3 bg-white rounded-xl border border-rose-200 space-y-2">
-                      <div className="text-[11px] font-semibold text-rose-900">
-                        Domain ของเว็บไซต์ Netlify ปัจจุบัน:
+                    <div className="mt-3 p-3 bg-white rounded-xl border border-rose-300 space-y-2">
+                      <div className="text-[11px] font-bold text-rose-900">
+                        โดเมนของ Netlify ที่ต้องนำไปใส่ใน Firebase Console:
                       </div>
                       <div className="flex items-center gap-2">
-                        <code className="flex-1 bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-lg text-slate-800 font-mono text-xs select-all truncate">
+                        <code className="flex-1 bg-slate-100 border border-slate-300 px-3 py-2 rounded-lg text-slate-900 font-mono text-xs select-all font-bold">
                           {currentHost}
                         </code>
                         <button
                           type="button"
                           onClick={copyCurrentDomain}
-                          className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-medium text-xs rounded-lg transition shrink-0 flex items-center space-x-1 cursor-pointer"
+                          className="px-3 py-2 bg-rose-600 hover:bg-rose-700 active:scale-95 text-white font-medium text-xs rounded-lg transition shrink-0 flex items-center space-x-1 cursor-pointer"
                         >
                           {copiedHostname ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                           <span>{copiedHostname ? 'คัดลอกแล้ว' : 'คัดลอก Domain'}</span>
                         </button>
                       </div>
-                      <p className="text-[11px] text-slate-600">
-                        💡 <strong>วิธีแก้ไข:</strong> เข้าสู่ Firebase Console &rarr; Authentication &rarr; Settings &rarr; เลื่อนลงไปที่ <strong>Authorized domains</strong> &rarr; กด <strong>Add domain</strong> แล้ววางโดเมนนี้ลงไป
-                      </p>
+                      <div className="text-[11px] text-slate-700 leading-relaxed bg-amber-50/80 p-2.5 rounded-lg border border-amber-200">
+                        <p className="font-semibold text-amber-900">📌 วิธีแก้ทันทีใน 1 นาที:</p>
+                        <ol className="list-decimal list-inside space-y-1 mt-1 text-slate-700">
+                          <li>เปิด <strong>Firebase Console</strong> &rarr; เลือกโปรเจกต์ <code>{activeProjectId}</code></li>
+                          <li>เมนูซ้าย <strong>Authentication</strong> &rarr; แท็บ <strong>Settings</strong></li>
+                          <li>เลื่อนลงไปที่ <strong>Authorized domains</strong> &rarr; กด <strong>Add domain</strong></li>
+                          <li>วาง <code>{currentHost}</code> แล้วกด <strong>Save</strong></li>
+                        </ol>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -1256,7 +1279,7 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
               {isLoggingIn ? (
                 <>
                   <RefreshCw className="w-5 h-5 animate-spin text-slate-400" />
-                  <span>กำลังเชื่อมต่อกับ Google...</span>
+                  <span>กำลังเชื่อมต่อกับ Google Authentication...</span>
                 </>
               ) : (
                 <>
@@ -1291,7 +1314,7 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
               className="w-full py-2.5 px-4 rounded-xl border border-slate-300 hover:bg-slate-50 active:scale-[0.99] disabled:opacity-60 text-slate-700 font-medium text-xs transition flex items-center justify-center space-x-2 cursor-pointer"
             >
               <Smartphone className="w-4 h-4 text-slate-500" />
-              <span>เข้าสู่ระบบด้วย Redirect Mode (สำหรับมือถือ / Safari / กรณีป็อปอัปไม่ขึ้น)</span>
+              <span>เข้าสู่ระบบด้วย Redirect Mode (กรณีมือถือ / Safari / หน้าต่างป็อปอัปไม่ขึ้น)</span>
             </button>
           </div>
 
@@ -1300,11 +1323,11 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
             <button
               type="button"
               onClick={() => setShowNetlifyGuide(!showNetlifyGuide)}
-              className="w-full flex items-center justify-between py-2 text-xs font-semibold text-slate-600 hover:text-indigo-600 transition cursor-pointer"
+              className="w-full flex items-center justify-between py-2 text-xs font-semibold text-slate-700 hover:text-indigo-600 transition cursor-pointer"
             >
               <span className="flex items-center space-x-1.5">
                 <Globe className="w-4 h-4 text-indigo-500" />
-                <span>Checklist & วิธีแก้ปัญหาล็อกอินบน Netlify & Firebase Console</span>
+                <span>ขั้นตอนตั้งค่าบน Firebase Console & Netlify สำหรับ {currentHost}</span>
               </span>
               {showNetlifyGuide ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
             </button>
@@ -1313,28 +1336,62 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
               <div className="mt-3 p-4 bg-slate-50 border border-slate-200 rounded-2xl text-xs text-slate-700 space-y-3 animate-in fade-in duration-150">
                 <div className="font-bold text-slate-900 flex items-center space-x-1.5">
                   <CheckCircle className="w-4 h-4 text-emerald-600" />
-                  <span>3 จุดสำคัญที่ต้องตรวจสอบเมื่อ Deploy บน Netlify:</span>
+                  <span>3 ขั้นตอนสำคัญเพื่อให้ Login บน Netlify สำเร็จ 100%:</span>
                 </div>
 
-                <div className="space-y-2.5">
-                  <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-1">
-                    <strong className="text-indigo-900 block font-semibold">1. เพิ่ม Netlify Domain ใน Firebase Authorized Domains:</strong>
+                <div className="space-y-3">
+                  {/* Step 1: Authorized domains */}
+                  <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-2">
+                    <strong className="text-indigo-900 block font-semibold text-xs">
+                      1. เพิ่ม Domain ใน Firebase Authorized Domains:
+                    </strong>
                     <p className="text-slate-600 leading-relaxed text-[11px]">
-                      ไปที่ <strong>Firebase Console</strong> &rarr; เลือกโปรเจกต์ของคุณ &rarr; <strong>Authentication</strong> &rarr; เมนู <strong>Settings</strong> &rarr; เลื่อนลงไปที่ <strong>Authorized domains</strong> &rarr; กดปุ่ม <strong>Add domain</strong> &rarr; วาง <code className="bg-slate-100 px-1 py-0.5 rounded font-mono text-indigo-700">{currentHost}</code> (หรือ <code className="bg-slate-100 px-1 py-0.5 rounded font-mono">your-site.netlify.app</code>) แล้วกดบันทึก
+                      ไปที่ <strong>Firebase Console</strong> &rarr; เลือกโปรเจกต์ <code>{activeProjectId}</code> &rarr; <strong>Authentication</strong> &rarr; เมนู <strong>Settings</strong> &rarr; เลื่อนลงไปที่ <strong>Authorized domains</strong> &rarr; กด <strong>Add domain</strong> &rarr; เพิ่มโดเมนต่อไปนี้:
                     </p>
+                    <div className="flex items-center gap-2">
+                      <code className="bg-slate-100 border border-slate-200 px-2 py-1 rounded text-indigo-700 font-mono text-[11px] font-bold">
+                        {currentHost}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={copyCurrentDomain}
+                        className="px-2 py-1 bg-slate-800 text-white rounded text-[10px] font-medium hover:bg-slate-700"
+                      >
+                        {copiedHostname ? 'คัดลอกแล้ว' : 'คัดลอก'}
+                      </button>
+                    </div>
                   </div>
 
-                  <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-1">
-                    <strong className="text-indigo-900 block font-semibold">2. ตรวจสอบการเปิดใช้งาน Google Sign-in Provider:</strong>
+                  {/* Step 2: Google Cloud Console Credentials */}
+                  <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-1.5">
+                    <strong className="text-indigo-900 block font-semibold text-xs">
+                      2. ตรวจสอบ Authorized JavaScript origins (Google Cloud Console):
+                    </strong>
                     <p className="text-slate-600 leading-relaxed text-[11px]">
-                      ไปที่ <strong>Firebase Console</strong> &rarr; <strong>Authentication</strong> &rarr; เมนู <strong>Sign-in method</strong> &rarr; ตรวจสอบว่า <strong>Google</strong> มีสถานะเป็น <strong>Enabled</strong> และมี Project support email ระบุไว้เรียบร้อยแล้ว
+                      เมื่อเปิดใช้งาน Google Sign-In ใน Firebase ระบบจะสร้าง OAuth Client ID ใน Google Cloud Console อัตโนมัติ:
                     </p>
+                    <div className="bg-slate-50 p-2 rounded border border-slate-200 text-[11px] font-mono space-y-1">
+                      <div><strong>Authorized JavaScript origins:</strong> <code>https://{currentHost}</code></div>
+                      <div><strong>Authorized redirect URIs:</strong> <code>https://{activeAuthDomain}/__/auth/handler</code></div>
+                    </div>
                   </div>
 
-                  <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-1">
-                    <strong className="text-indigo-900 block font-semibold">3. ตั้งค่า Environment Variables บน Netlify:</strong>
+                  {/* Step 3: Netlify Environment Variables */}
+                  <div className="p-3 bg-white rounded-xl border border-slate-200 space-y-1.5">
+                    <strong className="text-indigo-900 block font-semibold text-xs">
+                      3. ตั้งค่า Environment Variables บน Netlify:
+                    </strong>
                     <p className="text-slate-600 leading-relaxed text-[11px]">
-                      ไปที่ <strong>Netlify Dashboard</strong> &rarr; เลือกเว็บของคุณ &rarr; <strong>Site configuration</strong> &rarr; <strong>Environment variables</strong> &rarr; เพิ่มคีย์ <code>VITE_FIREBASE_API_KEY</code>, <code>VITE_FIREBASE_AUTH_DOMAIN</code>, <code>VITE_FIREBASE_PROJECT_ID</code> ฯลฯ ให้ครบถ้วน จากนั้นกด <strong>Trigger deploy &gt; Clear cache and deploy site</strong>
+                      ไปที่ <strong>Netlify Dashboard</strong> &rarr; <strong>Site configuration</strong> &rarr; <strong>Environment variables</strong> &rarr; ใส่คีย์ต่อไปนี้ให้ตรงกับโปรเจกต์:
+                    </p>
+                    <ul className="space-y-1 bg-slate-50 p-2 rounded border border-slate-200 text-[11px] font-mono text-slate-700">
+                      <li><code>VITE_FIREBASE_API_KEY</code> = {resolvedFirebaseConfig.apiKey ? `${resolvedFirebaseConfig.apiKey.slice(0, 8)}...` : '(ของคุณ)'}</li>
+                      <li><code>VITE_FIREBASE_AUTH_DOMAIN</code> = {activeAuthDomain}</li>
+                      <li><code>VITE_FIREBASE_PROJECT_ID</code> = {activeProjectId}</li>
+                      <li><code>VITE_FIREBASE_FIRESTORE_DATABASE_ID</code> = {resolvedFirebaseConfig.firestoreDatabaseId || 'ai-studio-studentscoreport-ce9f300f-6936-4725-995d-393fe9cdc335'}</li>
+                    </ul>
+                    <p className="text-[11px] text-amber-800 bg-amber-50 p-2 rounded">
+                      ⚠️ หลังจากบันทึกค่าใน Netlify แล้ว อย่าลืมกด <strong>Deploys &rarr; Trigger deploy &rarr; Clear cache and deploy site</strong> เพื่อให้เว็บ Build ด้วยค่าใหม่
                     </p>
                   </div>
                 </div>
