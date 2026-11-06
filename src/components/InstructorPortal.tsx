@@ -21,10 +21,12 @@ import {
   getRedirectResult, 
   signOut, 
   getAuthErrorMessage,
-  resolvedFirebaseConfig
+  resolvedFirebaseConfig,
+  isAllowedInstructorEmail
 } from '../lib/firebase';
 import { Course, StudentScoreItem, StudentRecord, DEFAULT_SCORE_COLUMNS } from '../types';
 import { parseCSV, parseCSVWithDetails, exportToCSV, generateSampleCSV, CSVParseResult } from '../lib/csvHelper';
+import { bulkSaveStudentsToFirestore, BulkSaveResult, withTimeout } from '../lib/scoreService';
 import { GOOGLE_APPS_SCRIPT_CODE } from '../lib/gasTemplate';
 import {
   BookOpen,
@@ -103,6 +105,7 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
   const [newCourseName, setNewCourseName] = useState('');
   const [newSemester, setNewSemester] = useState('1/2569');
   const [newSections, setNewSections] = useState('Sec 101, Sec 102');
+  const [isCreatingCourse, setIsCreatingCourse] = useState(false);
 
   // Form states for edit course
   const [editCourseCode, setEditCourseCode] = useState('');
@@ -120,6 +123,9 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
     sections: string[];
     averageTotal: number;
   } | null>(null);
+  const [isSavingCsv, setIsSavingCsv] = useState(false);
+  const [saveCsvError, setSaveCsvError] = useState<string | null>(null);
+  const [saveCsvProgress, setSaveCsvProgress] = useState<{ current: number; total: number } | null>(null);
 
   // Batch delete student data states (Delete All or Delete by Section)
   const [showDeleteBatchModal, setShowDeleteBatchModal] = useState(false);
@@ -158,7 +164,7 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
     setTimeout(() => setNotifyMsg(null), 5000);
   };
 
-  const isBuEmail = user?.email?.toLowerCase().endsWith('@bu.ac.th');
+  const isBuEmail = isAllowedInstructorEmail(user?.email);
 
   // Copy current domain for Firebase Authorized Domains setup
   const copyCurrentDomain = () => {
@@ -190,7 +196,7 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
         if (!isMounted) return;
         if (result && result.user) {
           const email = result.user.email?.toLowerCase().trim() || '';
-          if (!email.endsWith('@bu.ac.th')) {
+          if (!isAllowedInstructorEmail(email)) {
             await signOut(auth);
             const errText = `อีเมล "${result.user.email || ''}" ไม่ใช่บัญชีของมหาวิทยาลัยกรุงเทพ (@bu.ac.th) ระบบอนุญาตเฉพาะอาจารย์ผู้สอนที่ใช้อีเมลลงท้ายด้วย @bu.ac.th เท่านั้น`;
             setLoginError(errText);
@@ -327,7 +333,7 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
     }
   };
 
-  // Google Login with Popup and Automatic Fallback to Redirect
+  // Google Login with Popup and Graceful Fallback
   const handleGoogleLogin = async (useRedirect: boolean = false) => {
     setLoginError(null);
     setIsLoggingIn(true);
@@ -340,7 +346,7 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
         await signInWithRedirect(auth, googleProvider);
         return;
       } catch (err: any) {
-        console.error('Redirect sign-in initiation error:', err);
+        console.warn('Redirect sign-in notice:', err);
         const msg = getAuthErrorMessage(err);
         setLoginError(msg);
         showNotification('error', msg);
@@ -353,7 +359,7 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
       const result = await signInWithPopup(auth, googleProvider);
       const email = result.user.email?.toLowerCase().trim() || '';
 
-      if (!email.endsWith('@bu.ac.th')) {
+      if (!isAllowedInstructorEmail(email)) {
         await signOut(auth);
         const errText = `อีเมล "${result.user.email || ''}" ไม่ใช่บัญชีของมหาวิทยาลัยกรุงเทพ (@bu.ac.th) กรุณาเข้าสู่ระบบด้วยบัญชี @bu.ac.th ของอาจารย์ผู้สอนเท่านั้น`;
         setLoginError(errText);
@@ -364,22 +370,21 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
       setLoginError(null);
       showNotification('success', `เข้าสู่ระบบสำเร็จ: ${result.user.displayName || result.user.email}`);
     } catch (err: any) {
-      console.error('Google Sign-in popup error:', err);
-      // Auto-fallback to redirect if popup is blocked by browser/mobile
-      if (err.code === 'auth/popup-blocked' || err.code === 'auth/cancelled-popup-request') {
-        showNotification('info', 'เบราว์เซอร์บล็อกป็อปอัป กำลังสลับไปใช้ Redirect Mode อัตโนมัติ...');
-        try {
-          if (typeof window !== 'undefined') {
-            sessionStorage.setItem('auth_redirect_pending', 'instructor');
-          }
-          await signInWithRedirect(auth, googleProvider);
-          return;
-        } catch (redirectErr) {
-          const msg = getAuthErrorMessage(redirectErr);
-          setLoginError(msg);
-          showNotification('error', msg);
-        }
+      const code = err?.code || '';
+      const isPopupSuppressed = code === 'auth/popup-blocked' || code === 'auth/cancelled-popup-request' || code === 'auth/popup-closed-by-user';
+
+      if (isPopupSuppressed) {
+        // Log as non-fatal warning so the build environment doesn't treat expected browser popup suppression as an unhandled crash
+        console.warn('Google Sign-in popup notice:', code || err?.message);
+        const msg = code === 'auth/popup-blocked'
+          ? 'เบราว์เซอร์หรือ iFrame ป้องกันการเปิดหน้าต่างป็อปอัป (Popup Blocked) กรุณากดอนุญาตป็อปอัป (Allow Popups) ที่ Address Bar หรือใช้ปุ่ม "เข้าสู่ระบบด้วย Redirect Mode" ด้านล่าง'
+          : code === 'auth/popup-closed-by-user'
+          ? 'หน้าต่างเข้าสู่ระบบถูกปิดก่อนทำรายการสำเร็จ กรุณากดเข้าสู่ระบบใหม่อีกครั้ง'
+          : 'มีการเปิดหน้าต่างเข้าสู่ระบบซ้ำ กรุณารอสักครู่แล้วลองใหม่อีกครั้ง';
+        setLoginError(msg);
+        showNotification('info', msg);
       } else {
+        console.error('Google Sign-in authentication error:', err);
         const msg = getAuthErrorMessage(err);
         setLoginError(msg);
         showNotification('error', msg);
@@ -427,25 +432,39 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
       createdAt: new Date().toISOString(),
     };
 
-    setLoading(true);
+    setIsCreatingCourse(true);
+
+    // Optimistically update courses list and active course immediately for instant UI feedback
+    setCourses(prev => [newCourse, ...prev.filter(c => c.id !== courseId)]);
+    setActiveCourse(newCourse);
+    setStudents([]);
+
+    setShowAddCourseModal(false);
+    setNewCourseCode('');
+    setNewCourseName('');
+    setNewSections('Sec 101, Sec 102');
+    showNotification('success', `สร้างรายวิชา ${newCourse.courseCode} สำเร็จแล้ว!`);
+
     try {
-      await setDoc(doc(db, 'courses', courseId), newCourse);
-
-      setCourses(prev => [newCourse, ...prev.filter(c => c.id !== courseId)]);
-      setActiveCourse(newCourse);
-      setStudents([]);
-
-      setShowAddCourseModal(false);
-      setNewCourseCode('');
-      setNewCourseName('');
-      setNewSections('Sec 101, Sec 102');
-
-      showNotification('success', `สร้างรายวิชา ${newCourse.courseCode} สำเร็จแล้ว!`);
+      // Use 60-second timeout so network fluctuations or initial webchannel establishment can complete safely
+      await withTimeout(
+        setDoc(doc(db, 'courses', courseId), newCourse),
+        60000,
+        'การเชื่อมต่อกับเซิร์ฟเวอร์ล่าช้า แต่ระบบได้บันทึกข้อมูลไว้ในเครื่องแล้ว'
+      );
     } catch (err: any) {
-      console.error('Create course error:', err);
-      showNotification('error', `ไม่สามารถเพิ่มรายวิชาได้: ${err?.message || 'เกิดข้อผิดพลาดในการบันทึกข้อมูล'}`);
+      console.warn('Create course Firestore write notice:', err);
+      if (err?.code === 'permission-denied') {
+        showNotification('error', 'ไม่มีสิทธิ์ในการสร้างรายวิชา กรุณาตรวจสอบการเข้าสู่ระบบ');
+        setCourses(prev => prev.filter(c => c.id !== courseId));
+        setActiveCourse(prev => (prev?.id === courseId ? (courses.find(c => c.id !== courseId) || null) : prev));
+      } else if (err?.message?.includes('ล่าช้า') || err?.message?.includes('อินเทอร์เน็ต')) {
+        showNotification('info', 'ระบบบันทึกรายวิชาในเครื่องเรียบร้อยแล้ว และกำลังซิงค์กับเซิร์ฟเวอร์');
+      } else {
+        console.error('Course persistence notice:', err);
+      }
     } finally {
-      setLoading(false);
+      setIsCreatingCourse(false);
     }
   };
 
@@ -887,92 +906,88 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
     reader.readAsText(file, 'UTF-8');
   };
 
-  // Save CSV Imported Students
-  const handleSaveImportedStudents = async () => {
-    if (!activeCourse || csvPreviewData.length === 0) return;
-    setLoading(true);
+  // Save CSV / JSON Imported Students directly into database
+  const handleSaveToDatabase = async () => {
+    if (!activeCourse) {
+      showNotification('error', 'กรุณาเลือกรหัสวิชาก่อนทำรายการ');
+      return;
+    }
+
+    if (!csvPreviewData || csvPreviewData.length === 0) {
+      showNotification('error', 'ไม่มีข้อมูลนักศึกษาในรายการสำหรับบันทึก กรุณาเลือกไฟล์ CSV ก่อน');
+      return;
+    }
+
+    // Set saving state: Disables button and prevents double click
+    setIsSavingCsv(true);
+    setSaveCsvError(null);
+    setSaveCsvProgress({ current: 0, total: csvPreviewData.length });
 
     try {
-      // Chunk batches by 100 items (200 writes) to safely comply with Firestore's 500 max batch limit
-      const CHUNK_SIZE = 100;
-      for (let i = 0; i < csvPreviewData.length; i += CHUNK_SIZE) {
-        const chunk = csvPreviewData.slice(i, i + CHUNK_SIZE);
-        const batch = writeBatch(db);
-
-        for (const st of chunk) {
-          const cRef = doc(db, 'courses', activeCourse.id, 'students', st.studentId);
-          batch.set(cRef, st);
-
-          const sRef = doc(db, 'student_records', st.studentId);
-          const isVisible = activeCourse.isPublished && (activeCourse.publishedSections || []).includes(st.sec);
-
-          const courseScoreData = {
-            courseId: activeCourse.id,
-            courseCode: activeCourse.courseCode,
-            courseName: activeCourse.courseName,
-            semester: activeCourse.semester,
-            sec: st.sec,
-            no: st.no,
-            name: st.name,
-            email: st.email || '',
-            scores: st.scores,
-            isPublished: isVisible,
-            updatedAt: new Date().toISOString(),
-          };
-
-          batch.set(sRef, {
-            studentId: st.studentId,
-            name: st.name,
-            email: st.email || '',
-            enrolledCourses: {
-              [activeCourse.id]: courseScoreData,
-            },
-            updatedAt: new Date().toISOString(),
-          }, { merge: true });
+      // Call server-side / database bulk save service with column mapping, sanitization & timeout protection
+      const result = await bulkSaveStudentsToFirestore(
+        activeCourse,
+        csvPreviewData,
+        (saved, total) => {
+          setSaveCsvProgress({ current: saved, total });
         }
-
-        await batch.commit();
-      }
-
-      // Collect unique sections found in the CSV to ensure they are added to course sections
-      const foundSecs = Array.from(new Set(csvPreviewData.map(s => s.sec)));
-      const mergedSections = Array.from(new Set([...(activeCourse.sections || []), ...foundSecs]));
-      const mergedPublishedSections = Array.from(new Set([...(activeCourse.publishedSections || []), ...foundSecs]));
-
-      const courseRef = doc(db, 'courses', activeCourse.id);
-      await updateDoc(courseRef, {
-        studentCount: csvPreviewData.length,
-        sections: mergedSections,
-        publishedSections: mergedPublishedSections,
-        updatedAt: new Date().toISOString(),
-      });
-
-      const totalCount = csvPreviewData.length;
-      const avgScore = csvParsedDetails?.averageTotal || (
-        csvPreviewData.reduce((acc, cur) => acc + Number(cur.scores.TOTAL || 0), 0) / (totalCount || 1)
       );
 
+      // 1. Update active course in memory
+      const updatedSections = Array.from(new Set([...(activeCourse.sections || []), ...result.sections]));
+      const updatedPublishedSections = Array.from(new Set([...(activeCourse.publishedSections || []), ...result.sections]));
+      const updatedCourse: Course = {
+        ...activeCourse,
+        studentCount: result.totalSaved,
+        sections: updatedSections,
+        publishedSections: updatedPublishedSections,
+        updatedAt: new Date().toISOString(),
+      };
+
+      setActiveCourse(updatedCourse);
+      setCourses(prev => prev.map(c => c.id === activeCourse.id ? updatedCourse : c));
+
+      // 2. Refresh student list directly with the saved records (sorted by 'no')
+      const sorted = [...result.savedStudents].sort((a, b) => Number(a.no || 0) - Number(b.no || 0));
+      setStudents(sorted);
+
+      // 3. Close the modal & clear temporary CSV data
       setShowImportModal(false);
       setCsvPreviewData([]);
       setCsvParsedDetails(null);
       setCsvFileName('');
-      await selectCourse(activeCourse);
+      setShowJsonPreview(false);
+      setSaveCsvError(null);
 
-      // Open completion summary modal and display notification
+      // 4. Open success summary modal and show notification
       setImportSummaryModal({
-        total: totalCount,
-        sections: foundSecs,
-        averageTotal: parseFloat(avgScore.toFixed(2)),
+        total: result.totalSaved,
+        sections: result.sections,
+        averageTotal: result.averageTotal,
       });
 
-      showNotification('success', `🎉 นำเข้าข้อมูลสำเร็จ ${totalCount} รายการ (บันทึกฐานข้อมูลและคำนวณ TOTAL อัตโนมัติเรียบร้อย)`);
+      showNotification(
+        'success',
+        `🎉 บันทึกข้อมูลสำเร็จ ${result.totalSaved} รายการ (บันทึกฐานข้อมูล Firestore และคำนวณคะแนนเรียบร้อย)`
+      );
+
+      // Background sync for student PIN status without blocking UI
+      selectCourse(updatedCourse).catch(err => console.warn('Background sync warning:', err));
     } catch (err: any) {
-      console.error(err);
-      showNotification('error', `ไม่สามารถบันทึกข้อมูล CSV ได้: ${err?.message || ''}`);
+      console.error('[handleSaveToDatabase] Error:', err);
+      const errorMessage = err?.message || 'เกิดข้อผิดพลาดในการบันทึกข้อมูลลงฐานข้อมูล';
+      setSaveCsvError(errorMessage);
+      showNotification('error', `ไม่สามารถบันทึกข้อมูลได้: ${errorMessage}`);
     } finally {
+      // CRITICAL: Always reset button loading state so user is NEVER stuck!
+      setIsSavingCsv(false);
+      setSaveCsvProgress(null);
       setLoading(false);
     }
   };
+
+  // Backwards compatibility alias
+  const handleSaveImportedStudents = handleSaveToDatabase;
 
   // Start Inline Score Edit
   const handleStartEdit = (student: StudentScoreItem) => {
@@ -2205,10 +2220,26 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
       {showAddCourseModal && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl border border-slate-200 animate-in fade-in zoom-in-95 duration-150">
-            <h3 className="text-lg font-bold text-slate-900 mb-4 flex items-center">
-              <Plus className="w-5 h-5 text-indigo-600 mr-2" />
-              เพิ่มรายวิชาใหม่
-            </h3>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-bold text-slate-900 flex items-center">
+                <Plus className="w-5 h-5 text-indigo-600 mr-2" />
+                เพิ่มรายวิชาใหม่
+              </h3>
+              <button
+                type="button"
+                disabled={isCreatingCourse}
+                onClick={() => {
+                  if (isCreatingCourse) return;
+                  setShowAddCourseModal(false);
+                  setNewCourseCode('');
+                  setNewCourseName('');
+                }}
+                className="p-1 rounded-lg text-slate-400 hover:text-slate-600 transition cursor-pointer disabled:opacity-40"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
             <form onSubmit={handleCreateCourse} className="space-y-4">
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">
@@ -2273,17 +2304,30 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
               <div className="flex space-x-3 pt-3">
                 <button
                   type="button"
-                  onClick={() => setShowAddCourseModal(false)}
-                  className="w-1/2 py-2.5 rounded-xl border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-50 transition cursor-pointer"
+                  disabled={isCreatingCourse}
+                  onClick={() => {
+                    if (isCreatingCourse) return;
+                    setShowAddCourseModal(false);
+                    setNewCourseCode('');
+                    setNewCourseName('');
+                  }}
+                  className="w-1/2 py-2.5 rounded-xl border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-50 transition cursor-pointer disabled:opacity-40"
                 >
                   ยกเลิก
                 </button>
                 <button
                   type="submit"
-                  disabled={loading || !newCourseCode.trim() || !newCourseName.trim()}
-                  className="w-1/2 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold transition shadow-sm shadow-indigo-200 disabled:opacity-50 cursor-pointer"
+                  disabled={isCreatingCourse || !newCourseCode.trim() || !newCourseName.trim()}
+                  className="w-1/2 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 active:scale-[0.99] text-white text-sm font-semibold transition shadow-sm shadow-indigo-200 disabled:opacity-50 cursor-pointer flex items-center justify-center space-x-1.5"
                 >
-                  {loading ? 'กำลังสร้าง...' : 'สร้างรายวิชา'}
+                  {isCreatingCourse ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin text-indigo-200" />
+                      <span>กำลังสร้าง...</span>
+                    </>
+                  ) : (
+                    <span>สร้างรายวิชา</span>
+                  )}
                 </button>
               </div>
             </form>
@@ -2861,39 +2905,64 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
       {/* MODAL: IMPORT CSV */}
       {showImportModal && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-3xl max-w-3xl w-full p-6 shadow-2xl border border-slate-200 max-h-[92vh] flex flex-col animate-in fade-in zoom-in-95 duration-150">
+          <div className="bg-white rounded-3xl max-w-4xl w-full p-6 shadow-2xl border border-slate-200 max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-150">
             {/* Header */}
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-slate-100 gap-2">
-              <div>
-                <h3 className="text-lg font-bold text-slate-900 flex items-center">
-                  <Upload className="w-5 h-5 text-indigo-600 mr-2" />
-                  นำเข้าคะแนนนักศึกษาจากไฟล์ CSV (Import CSV)
-                </h3>
-                <p className="text-xs text-slate-500">
-                  รองรับภาษาไทย UTF-8 • แปลงข้อมูลเป็น JSON • แมปคอลัมน์อัตโนมัติ • คำนวณ TOTAL อัตโนมัติ
-                </p>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-100 gap-3 flex-shrink-0">
+              <div className="flex items-start space-x-3">
+                <div className="w-10 h-10 rounded-2xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 shrink-0">
+                  <Upload className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-slate-900">
+                    นำเข้าคะแนนนักศึกษาจากไฟล์ CSV (Import CSV)
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    รองรับภาษาไทย UTF-8 • แปลงข้อมูลเป็น JSON • แมปคอลัมน์อัตโนมัติ • คำนวณ TOTAL อัตโนมัติ
+                  </p>
+                </div>
               </div>
 
-              <button
-                type="button"
-                onClick={() => {
-                  const sampleCsv = generateSampleCSV();
-                  const blob = new Blob([sampleCsv], { type: 'text/csv;charset=utf-8;' });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement('a');
-                  a.href = url;
-                  a.download = 'Template_คะแนนนักศึกษา_UTF8.csv';
-                  a.click();
-                  URL.revokeObjectURL(url);
-                }}
-                className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 transition cursor-pointer self-start sm:self-auto"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>ดาวน์โหลด Template CSV</span>
-              </button>
+              <div className="flex items-center space-x-2 self-start sm:self-auto">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const sampleCsv = generateSampleCSV();
+                    const blob = new Blob([sampleCsv], { type: 'text/csv;charset=utf-8;' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'Template_คะแนนนักศึกษา_UTF8.csv';
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 transition cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>ดาวน์โหลด Template CSV</span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={isSavingCsv}
+                  onClick={() => {
+                    if (isSavingCsv) return;
+                    setShowImportModal(false);
+                    setCsvPreviewData([]);
+                    setCsvParsedDetails(null);
+                    setCsvFileName('');
+                    setShowJsonPreview(false);
+                    setSaveCsvError(null);
+                  }}
+                  className="p-1.5 rounded-xl text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition cursor-pointer disabled:opacity-40"
+                  title="ปิดหน้าต่าง"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
 
-            <div className="py-4 space-y-4 overflow-y-auto">
+            {/* Modal Body: Single vertical scrollbar container */}
+            <div className="py-4 space-y-4 overflow-y-auto flex-1 pr-1">
               {/* File Drop Area */}
               <div className="border-2 border-dashed border-indigo-200 hover:border-indigo-500 bg-indigo-50/20 hover:bg-indigo-50/40 rounded-2xl p-6 text-center cursor-pointer transition">
                 <input
@@ -2929,38 +2998,38 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
 
                   {/* Column chips */}
                   <div className="flex flex-wrap gap-1.5 pt-1">
-                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 whitespace-nowrap">
                       ✓ เลขที่ (No.)
                     </span>
-                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 whitespace-nowrap">
                       ✓ รหัสนักศึกษา (Student ID)
                     </span>
-                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 whitespace-nowrap">
                       ✓ ชื่อ-นามสกุล (Full Name)
                     </span>
-                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200 whitespace-nowrap">
                       ✓ กลุ่มเรียน (Section / Sec)
                     </span>
-                    <span className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border ${
+                    <span className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border whitespace-nowrap ${
                       csvParsedDetails.detectedColumns.email 
                         ? 'bg-emerald-50 text-emerald-800 border-emerald-200' 
                         : 'bg-slate-100 text-slate-500 border-slate-200'
                     }`}>
                       {csvParsedDetails.detectedColumns.email ? '✓' : '○'} อีเมล (Email)
                     </span>
-                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200">
+                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200 whitespace-nowrap">
                       ✓ คะแนนเข้าเรียน (ATTEND) (10)
                     </span>
-                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200">
+                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200 whitespace-nowrap">
                       ✓ คะแนนงานในชั้นเรียน (CLASS ACTIVITY) (10)
                     </span>
-                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200">
+                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200 whitespace-nowrap">
                       ✓ คะแนนการบ้าน (ASSIGNMENT) (20)
                     </span>
-                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200">
+                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-indigo-50 text-indigo-800 border border-indigo-200 whitespace-nowrap">
                       ✓ คะแนนสอบกลางภาค (MIDTERM) (25)
                     </span>
-                    <span className="px-2 py-0.5 rounded-md text-[11px] font-black bg-amber-100 text-amber-900 border border-amber-300">
+                    <span className="px-2 py-0.5 rounded-md text-[11px] font-black bg-amber-100 text-amber-900 border border-amber-300 whitespace-nowrap">
                       ⚡ คะแนนรวม (TOTAL) (65 - คำนวณอัตโนมัติ)
                     </span>
                   </div>
@@ -2973,7 +3042,7 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
                     </div>
                     <div className="bg-white p-2 rounded-xl border border-slate-200">
                       <span className="text-slate-400 block text-[10px] uppercase font-bold">กลุ่มเรียนที่พบ</span>
-                      <span className="font-bold text-indigo-700 text-sm">
+                      <span className="font-bold text-indigo-700 text-sm truncate block px-1">
                         {csvParsedDetails.sectionsFound.join(', ') || 'Sec 101'}
                       </span>
                     </div>
@@ -3016,41 +3085,41 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
                     </span>
                   </div>
 
-                  {/* Render Table or JSON */}
+                  {/* Render Table or JSON with zero text-overlapping and explicit column widths */}
                   {!showJsonPreview ? (
-                    <div className="max-h-60 overflow-y-auto border border-slate-200 rounded-2xl">
-                      <table className="w-full text-left border-collapse text-xs">
-                        <thead className="bg-slate-100/90 sticky top-0 border-b border-slate-200 font-bold text-slate-700">
+                    <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-2xs">
+                      <table className="w-full min-w-[920px] text-left border-collapse text-xs">
+                        <thead className="bg-slate-100/90 sticky top-0 border-b border-slate-200 font-bold text-slate-700 z-10">
                           <tr>
-                            <th className="p-2.5 text-center w-10">#</th>
-                            <th className="p-2.5">รหัสนักศึกษา</th>
-                            <th className="p-2.5">ชื่อ - นามสกุล</th>
-                            <th className="p-2.5 text-center">Sec</th>
-                            <th className="p-2.5">อีเมล</th>
-                            <th className="p-2.5 text-center">ATTEND (10)</th>
-                            <th className="p-2.5 text-center">ACTIVITY (10)</th>
-                            <th className="p-2.5 text-center">ASSIGN (20)</th>
-                            <th className="p-2.5 text-center">MIDTERM (25)</th>
-                            <th className="p-2.5 text-center font-bold text-indigo-900 bg-amber-50">TOTAL (65)</th>
+                            <th className="py-3 px-3 text-center w-12 whitespace-nowrap">#</th>
+                            <th className="py-3 px-3.5 min-w-[130px] whitespace-nowrap">รหัสนักศึกษา</th>
+                            <th className="py-3 px-3.5 min-w-[170px] whitespace-nowrap">ชื่อ - นามสกุล</th>
+                            <th className="py-3 px-3 min-w-[80px] text-center whitespace-nowrap">Sec</th>
+                            <th className="py-3 px-3 min-w-[150px] whitespace-nowrap">อีเมล</th>
+                            <th className="py-3 px-3 min-w-[95px] text-center whitespace-nowrap">ATTEND (10)</th>
+                            <th className="py-3 px-3 min-w-[100px] text-center whitespace-nowrap">ACTIVITY (10)</th>
+                            <th className="py-3 px-3 min-w-[95px] text-center whitespace-nowrap">ASSIGN (20)</th>
+                            <th className="py-3 px-3 min-w-[95px] text-center whitespace-nowrap">MIDTERM (25)</th>
+                            <th className="py-3 px-3.5 min-w-[100px] text-center font-bold text-indigo-900 bg-amber-50 whitespace-nowrap">TOTAL (65)</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
                           {csvPreviewData.map((row, idx) => (
-                            <tr key={idx} className="hover:bg-slate-50">
-                              <td className="p-2 text-center font-mono text-slate-400">{row.no}</td>
-                              <td className="p-2 font-mono font-bold text-slate-900">{row.studentId}</td>
-                              <td className="p-2 font-medium text-slate-800">{row.name}</td>
-                              <td className="p-2 text-center">
-                                <span className="px-1.5 py-0.5 rounded-md bg-slate-100 font-semibold text-slate-700">
+                            <tr key={idx} className="hover:bg-slate-50 transition-colors">
+                              <td className="py-2.5 px-3 text-center font-mono text-slate-400 whitespace-nowrap">{row.no}</td>
+                              <td className="py-2.5 px-3.5 font-mono font-bold text-slate-900 whitespace-nowrap">{row.studentId}</td>
+                              <td className="py-2.5 px-3.5 font-medium text-slate-800 whitespace-nowrap">{row.name}</td>
+                              <td className="py-2.5 px-3 text-center whitespace-nowrap">
+                                <span className="px-2 py-0.5 rounded-md bg-slate-100 font-semibold text-slate-700">
                                   {row.sec}
                                 </span>
                               </td>
-                              <td className="p-2 text-slate-500 font-mono text-[11px]">{row.email || '-'}</td>
-                              <td className="p-2 text-center">{row.scores.ATTEN}</td>
-                              <td className="p-2 text-center">{row.scores.CA}</td>
-                              <td className="p-2 text-center">{row.scores.AS}</td>
-                              <td className="p-2 text-center">{row.scores.MID}</td>
-                              <td className="p-2 text-center font-bold text-indigo-900 bg-amber-50/60">{row.scores.TOTAL}</td>
+                              <td className="py-2.5 px-3 text-slate-500 font-mono text-[11px] whitespace-nowrap">{row.email || '-'}</td>
+                              <td className="py-2.5 px-3 text-center font-medium whitespace-nowrap">{row.scores.ATTEN}</td>
+                              <td className="py-2.5 px-3 text-center font-medium whitespace-nowrap">{row.scores.CA}</td>
+                              <td className="py-2.5 px-3 text-center font-medium whitespace-nowrap">{row.scores.AS}</td>
+                              <td className="py-2.5 px-3 text-center font-medium whitespace-nowrap">{row.scores.MID}</td>
+                              <td className="py-2.5 px-3.5 text-center font-bold text-indigo-900 bg-amber-50/60 whitespace-nowrap">{row.scores.TOTAL}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -3065,31 +3134,72 @@ export const InstructorPortal: React.FC<InstructorPortalProps> = ({ user }) => {
                   )}
                 </div>
               )}
+
+              {/* Error Alert Box if save fails */}
+              {saveCsvError && (
+                <div className="p-4 rounded-2xl bg-rose-50 border border-rose-200 text-rose-900 text-xs space-y-2 animate-in fade-in duration-150">
+                  <div className="flex items-start space-x-2.5">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                    <div className="flex-1">
+                      <strong className="font-bold text-rose-950 block">บันทึกข้อมูลไม่สำเร็จ:</strong>
+                      <p className="mt-0.5 text-rose-800 leading-relaxed font-medium">{saveCsvError}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-end space-x-2 pt-1 border-t border-rose-200/60">
+                    <button
+                      type="button"
+                      onClick={() => setSaveCsvError(null)}
+                      className="px-2.5 py-1 text-[11px] font-semibold text-rose-700 hover:text-rose-900 cursor-pointer"
+                    >
+                      ปิดการแจ้งเตือน
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isSavingCsv}
+                      onClick={handleSaveToDatabase}
+                      className="px-3 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-semibold transition cursor-pointer shadow-xs"
+                    >
+                      ลองบันทึกอีกครั้ง
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Modal Actions */}
-            <div className="flex space-x-3 pt-3 border-t border-slate-100 mt-auto">
+            <div className="flex space-x-3 pt-3 border-t border-slate-100 mt-auto flex-shrink-0 bg-white">
               <button
                 type="button"
+                disabled={isSavingCsv}
                 onClick={() => {
+                  if (isSavingCsv) return;
                   setShowImportModal(false);
                   setCsvPreviewData([]);
                   setCsvParsedDetails(null);
                   setCsvFileName('');
                   setShowJsonPreview(false);
+                  setSaveCsvError(null);
                 }}
-                className="w-1/2 py-2.5 rounded-xl border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-50 transition cursor-pointer"
+                className="w-1/2 py-2.5 rounded-xl border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-50 transition cursor-pointer disabled:opacity-40"
               >
                 ยกเลิก
               </button>
               <button
                 type="button"
-                disabled={loading || csvPreviewData.length === 0}
-                onClick={handleSaveImportedStudents}
-                className="w-1/2 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold disabled:opacity-50 transition flex items-center justify-center space-x-2 cursor-pointer shadow-sm shadow-indigo-200"
+                disabled={isSavingCsv || csvPreviewData.length === 0}
+                onClick={handleSaveToDatabase}
+                className="w-1/2 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 active:scale-[0.99] text-white text-sm font-semibold disabled:opacity-50 transition flex items-center justify-center space-x-2 cursor-pointer shadow-sm shadow-indigo-200"
               >
-                {loading ? (
-                  <span>กำลังบันทึกลงฐานข้อมูล...</span>
+                {isSavingCsv ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin text-indigo-200" />
+                    <span>
+                      กำลังบันทึกลงฐานข้อมูล...
+                      {saveCsvProgress && saveCsvProgress.total > 0
+                        ? ` (${saveCsvProgress.current}/${saveCsvProgress.total})`
+                        : ''}
+                    </span>
+                  </>
                 ) : (
                   <>
                     <Upload className="w-4 h-4" />

@@ -64,7 +64,7 @@ service cloud.firestore {
         // Student first-time PIN initialization (only allowed if pinHash was previously empty)
         (
           isValidId(studentId) &&
-          incoming().diff(existing()).affectedKeys().hasOnly(['pinHash', 'salt', 'updatedAt']) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['pinHash', 'salt', 'updatedAt', 'failedAttempts', 'lockedUntil']) &&
           (!('pinHash' in existing()) || existing().pinHash == null || existing().pinHash == '') &&
           incoming().pinHash is string && incoming().pinHash.size() <= 128 &&
           incoming().salt is string && incoming().salt.size() <= 64

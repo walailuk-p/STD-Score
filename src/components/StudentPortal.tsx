@@ -62,11 +62,13 @@ export const StudentPortal: React.FC = () => {
    * 3. Enforce data privacy: strictly restricts queries to the authenticated student's doc
    * 4. Hide course card if instructor disabled course-level OR section-level visibility
    */
-  const fetchStudentDataAndScores = async (studentId: string): Promise<boolean> => {
+  const fetchStudentDataAndScores = async (studentId: string, showGlobalLoading = true): Promise<boolean> => {
     const cleanId = studentId.trim().replace(/[^0-9a-zA-Z]/g, '');
     if (!cleanId) return false;
 
-    setLoading(true);
+    if (showGlobalLoading) {
+      setLoading(true);
+    }
     setErrorMsg(null);
 
     try {
@@ -87,13 +89,21 @@ export const StudentPortal: React.FC = () => {
         ? Object.values(data.enrolledCourses)
         : [];
 
-      // Verify each course's live visibility from /courses/{courseId}
+      // Immediately populate initial list from local data so UI displays instantly without lag
+      const initialVisible = enrolledList.filter(c => c.isPublished !== false);
+      initialVisible.sort((a, b) => (a.courseCode || '').localeCompare(b.courseCode || ''));
+      setLivePublishedCourses(initialVisible);
+
+      // Verify each course's live visibility from /courses/{courseId} with 5s timeout guard
       const visibilityPromises = enrolledList.map(async course => {
         try {
           const courseRef = doc(db, 'courses', course.courseId);
-          const courseSnap = await getDoc(courseRef);
+          const courseSnap = await Promise.race([
+            getDoc(courseRef),
+            new Promise<null>(res => setTimeout(() => res(null), 5000))
+          ]);
 
-          if (courseSnap.exists()) {
+          if (courseSnap && courseSnap.exists()) {
             const courseData = courseSnap.data();
             // Section-level visibility (สวิตช์เปิด/ปิดประกาศแยกตามกลุ่มเรียน เช่น Sec 101, Sec 206A)
             const isSecOpen = Array.isArray(courseData.publishedSections)
@@ -113,8 +123,8 @@ export const StudentPortal: React.FC = () => {
             // Closed for this section -> Hide from view
             return null;
           } else {
-            // Course was removed
-            return null;
+            // Fallback to stored isPublished flag if fetch timed out or doc doesn't exist
+            return course.isPublished ? course : null;
           }
         } catch (e) {
           // If offline or query fallback, use stored isPublished flag
@@ -124,7 +134,7 @@ export const StudentPortal: React.FC = () => {
 
       const resolved = await Promise.all(visibilityPromises);
       const visibleCourses = resolved.filter((c): c is EnrolledCourseScore => c !== null);
-      visibleCourses.sort((a, b) => a.courseCode.localeCompare(b.courseCode));
+      visibleCourses.sort((a, b) => (a.courseCode || '').localeCompare(b.courseCode || ''));
 
       setLivePublishedCourses(visibleCourses);
       return true;
@@ -133,7 +143,9 @@ export const StudentPortal: React.FC = () => {
       setErrorMsg('เกิดข้อผิดพลาดในการโหลดข้อมูลผลคะแนน กรุณาลองใหม่อีกครั้ง');
       return false;
     } finally {
-      setLoading(false);
+      if (showGlobalLoading) {
+        setLoading(false);
+      }
     }
   };
 
@@ -183,7 +195,6 @@ export const StudentPortal: React.FC = () => {
 
       if (!docSnap.exists()) {
         setErrorMsg('ไม่พบข้อมูลของรหัสนักศึกษานี้ในระบบ หรืออาจารย์ยังไม่ได้นำเข้ารายชื่อ');
-        setLoading(false);
         return;
       }
 
@@ -234,13 +245,39 @@ export const StudentPortal: React.FC = () => {
       const hashed = await hashPin(pin, salt);
 
       const docRef = doc(db, 'student_records', studentRecord.studentId);
-      await updateDoc(docRef, {
+      
+      // Update Firestore with 6-second timeout race to prevent indefinite freeze
+      await Promise.race([
+        updateDoc(docRef, {
+          pinHash: hashed,
+          salt: salt,
+          failedAttempts: 0,
+          lockedUntil: 0,
+          updatedAt: new Date().toISOString(),
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('การเชื่อมต่อกับระบบฐานข้อมูลใช้เวลานานเกินไป กรุณาลองใหม่อีกครั้ง')), 6000)
+        ),
+      ]);
+
+      // Update in-memory studentRecord immediately for instant UI responsiveness
+      const updatedRecord: StudentRecord = {
+        ...studentRecord,
         pinHash: hashed,
         salt: salt,
         failedAttempts: 0,
         lockedUntil: 0,
         updatedAt: new Date().toISOString(),
-      });
+      };
+      setStudentRecord(updatedRecord);
+
+      // Pre-populate enrolled courses immediately so student doesn't wait for background fetch
+      const enrolledList: EnrolledCourseScore[] = updatedRecord.enrolledCourses
+        ? Object.values(updatedRecord.enrolledCourses)
+        : [];
+      const initialVisible = enrolledList.filter(c => c.isPublished !== false);
+      initialVisible.sort((a, b) => (a.courseCode || '').localeCompare(b.courseCode || ''));
+      setLivePublishedCourses(initialVisible);
 
       // Generate Session Token and persist in sessionStorage (Condition 1)
       const token = `st_session_${studentRecord.studentId}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -253,16 +290,24 @@ export const StudentPortal: React.FC = () => {
       setSessionToken(token);
       setActiveStudentId(studentRecord.studentId);
 
-      // Load full student scores & live visibility
-      await fetchStudentDataAndScores(studentRecord.studentId);
+      // Reset PIN inputs
+      setPinInput('');
+      setConfirmPinInput('');
 
+      // Seamlessly transition UI step to view_scores immediately
       setStep('view_scores');
       setSuccessMsg('ตั้งรหัสผ่าน 6 หลักสำเร็จ! คุณสามารถใช้รหัสนี้เข้าสู่ระบบในครั้งถัดไป');
-    } catch (err) {
+
+      // Refresh student scores & live visibility in background WITHOUT setting global loading indicator
+      fetchStudentDataAndScores(studentRecord.studentId, false).catch(err => {
+        console.warn('Fetch scores background notice:', err);
+      });
+    } catch (err: any) {
       console.error('Error setting PIN:', err);
-      handleFirestoreError(err, OperationType.UPDATE, `student_records/${studentRecord.studentId}`);
-      setErrorMsg('ไม่สามารถบันทึกรหัสผ่านได้ กรุณาลองใหม่อีกครั้ง');
+      const msg = err?.message || 'ไม่สามารถบันทึกรหัสผ่านได้ กรุณาลองใหม่อีกครั้ง';
+      setErrorMsg(msg);
     } finally {
+      // Guaranteed termination of button loading state
       setLoading(false);
     }
   };
@@ -291,13 +336,21 @@ export const StudentPortal: React.FC = () => {
       const docRef = doc(db, 'student_records', studentRecord.studentId);
 
       if (isValid) {
-        // Reset failed attempts upon successful login
+        // Pre-populate enrolled courses immediately from in-memory record
+        const enrolledList: EnrolledCourseScore[] = studentRecord.enrolledCourses
+          ? Object.values(studentRecord.enrolledCourses)
+          : [];
+        const initialVisible = enrolledList.filter(c => c.isPublished !== false);
+        initialVisible.sort((a, b) => (a.courseCode || '').localeCompare(b.courseCode || ''));
+        setLivePublishedCourses(initialVisible);
+
+        // Reset failed attempts in Firestore asynchronously if previously recorded
         if ((studentRecord.failedAttempts || 0) > 0) {
-          await updateDoc(docRef, {
+          updateDoc(docRef, {
             failedAttempts: 0,
             lockedUntil: 0,
             updatedAt: new Date().toISOString(),
-          });
+          }).catch(e => console.warn('Could not reset failedAttempts:', e));
         }
 
         // Generate Session Token and save in sessionStorage (Condition 1)
@@ -311,23 +364,31 @@ export const StudentPortal: React.FC = () => {
         setSessionToken(token);
         setActiveStudentId(studentRecord.studentId);
 
-        // Fetch scores & live visibility
-        await fetchStudentDataAndScores(studentRecord.studentId);
-
+        // Immediate transition to view_scores
         setStep('view_scores');
         setPinInput('');
+        setConfirmPinInput('');
         setSuccessMsg(null);
+
+        // Background update for latest course & section publication status without blocking UI
+        fetchStudentDataAndScores(studentRecord.studentId, false).catch(err => {
+          console.warn('Background score update notice:', err);
+        });
       } else {
         const newFailedAttempts = (studentRecord.failedAttempts || 0) + 1;
         const willLock = newFailedAttempts >= 5;
         const lockDurationMs = 15 * 60 * 1000; // 15 minutes lockout
         const lockedUntilTime = willLock ? Date.now() + lockDurationMs : 0;
 
-        await updateDoc(docRef, {
-          failedAttempts: newFailedAttempts,
-          lockedUntil: lockedUntilTime,
-          updatedAt: new Date().toISOString(),
-        });
+        try {
+          await updateDoc(docRef, {
+            failedAttempts: newFailedAttempts,
+            lockedUntil: lockedUntilTime,
+            updatedAt: new Date().toISOString(),
+          });
+        } catch (e) {
+          console.warn('Could not update failedAttempts in firestore:', e);
+        }
 
         setStudentRecord(prev => prev ? {
           ...prev,
@@ -341,10 +402,11 @@ export const StudentPortal: React.FC = () => {
           setErrorMsg(`รหัสผ่านไม่ถูกต้อง (เหลือโอกาสลองอีก ${5 - newFailedAttempts} ครั้ง)`);
         }
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error verifying PIN:', err);
       setErrorMsg('เกิดข้อผิดพลาดในการตรวจสอบรหัสผ่าน กรุณาลองใหม่อีกครั้ง');
     } finally {
+      // Guaranteed termination of button loading state
       setLoading(false);
     }
   };
@@ -789,15 +851,21 @@ export const StudentPortal: React.FC = () => {
               <div className="flex space-x-3 pt-2">
                 <button
                   type="button"
-                  onClick={() => setStep('enter_id')}
-                  className="w-1/3 py-3 px-3 rounded-xl border border-slate-300 text-slate-700 font-medium text-sm hover:bg-slate-50 transition"
+                  disabled={loading}
+                  onClick={() => {
+                    setStep('enter_id');
+                    setPinInput('');
+                    setConfirmPinInput('');
+                    setErrorMsg(null);
+                  }}
+                  className="w-1/3 py-3 px-3 rounded-xl border border-slate-300 text-slate-700 font-medium text-sm hover:bg-slate-50 transition cursor-pointer disabled:opacity-40"
                 >
                   ย้อนกลับ
                 </button>
                 <button
                   type="submit"
                   disabled={loading || pinInput.length !== 6 || confirmPinInput.length !== 6}
-                  className="w-2/3 py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-sm shadow-md shadow-indigo-100 disabled:opacity-50 transition flex items-center justify-center space-x-2"
+                  className="w-2/3 py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-sm shadow-md shadow-indigo-100 disabled:opacity-50 transition flex items-center justify-center space-x-2 cursor-pointer"
                 >
                   {loading ? (
                     <>
@@ -822,8 +890,14 @@ export const StudentPortal: React.FC = () => {
                 </div>
                 <button
                   type="button"
-                  onClick={() => setStep('enter_id')}
-                  className="text-xs text-indigo-600 hover:underline"
+                  disabled={loading}
+                  onClick={() => {
+                    setStep('enter_id');
+                    setPinInput('');
+                    setConfirmPinInput('');
+                    setErrorMsg(null);
+                  }}
+                  className="text-xs text-indigo-600 hover:underline cursor-pointer disabled:opacity-40"
                 >
                   เปลี่ยนรหัส
                 </button>

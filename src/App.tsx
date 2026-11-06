@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { onAuthStateChanged, User as FirebaseUser, signOut } from 'firebase/auth';
-import { auth } from './lib/firebase';
+import { auth, isAllowedInstructorEmail } from './lib/firebase';
 import { Navbar } from './components/Navbar';
 import { StudentPortal } from './components/StudentPortal';
 import { InstructorPortal } from './components/InstructorPortal';
@@ -20,8 +20,8 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, async user => {
       if (user) {
         const email = user.email?.toLowerCase().trim() || '';
-        if (!email.endsWith('@bu.ac.th')) {
-          console.warn('Rejected non-bu email in App state:', email);
+        if (!isAllowedInstructorEmail(email)) {
+          console.warn('Rejected unauthorized instructor email in App state:', email);
           if (typeof window !== 'undefined') {
             sessionStorage.setItem(
               'bu_auth_rejected_error',

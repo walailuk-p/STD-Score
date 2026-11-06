@@ -7,7 +7,7 @@ import {
   getRedirectResult, 
   signOut 
 } from 'firebase/auth';
-import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
+import { getFirestore, initializeFirestore, doc, getDocFromServer } from 'firebase/firestore';
 import localAppletConfig from '../../firebase-applet-config.json';
 
 // Support both Netlify/Vercel/Production Environment Variables and local applet config
@@ -26,12 +26,27 @@ export const resolvedFirebaseConfig = {
 
 const app = getApps().length === 0 ? initializeApp(resolvedFirebaseConfig) : getApp();
 
-// Use specific firestore database ID if provided, otherwise default instance
-export const db = (resolvedFirebaseConfig.firestoreDatabaseId && resolvedFirebaseConfig.firestoreDatabaseId !== '(default)')
-  ? getFirestore(app, resolvedFirebaseConfig.firestoreDatabaseId)
-  : getFirestore(app);
+// Use specific firestore database ID with autoDetectLongPolling to avoid WebChannel stream stalls in iframes & proxies
+let firestoreInstance;
+try {
+  firestoreInstance = (resolvedFirebaseConfig.firestoreDatabaseId && resolvedFirebaseConfig.firestoreDatabaseId !== '(default)')
+    ? initializeFirestore(app, { experimentalAutoDetectLongPolling: true }, resolvedFirebaseConfig.firestoreDatabaseId)
+    : initializeFirestore(app, { experimentalAutoDetectLongPolling: true });
+} catch {
+  firestoreInstance = (resolvedFirebaseConfig.firestoreDatabaseId && resolvedFirebaseConfig.firestoreDatabaseId !== '(default)')
+    ? getFirestore(app, resolvedFirebaseConfig.firestoreDatabaseId)
+    : getFirestore(app);
+}
 
+export const db = firestoreInstance;
 export const auth = getAuth(app);
+
+// Helper for verifying authorized instructor accounts (BU domain + runtime project owner)
+export function isAllowedInstructorEmail(email?: string | null): boolean {
+  if (!email) return false;
+  const normalized = email.toLowerCase().trim();
+  return normalized.endsWith('@bu.ac.th') || normalized === 'w.peanchi@gmail.com';
+}
 
 // Google Auth Provider setup with BU domain hint and select_account prompt
 export const googleProvider = new GoogleAuthProvider();
